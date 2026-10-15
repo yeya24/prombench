@@ -7,13 +7,15 @@ set -u
 EMBEDMD_BIN=${EMBEDMD_BIN:-embedmd}
 SED_BIN=${SED_BIN:-sed}
 
-README_FILES="./tools/*/README.md ./funcbench/README.md ./infra/README.md"
+README_FILES="./tools/*/README.md ./infra/README.md"
 
-primary_tools=("infra" "funcbench")
-helper_tools=("amGithubNotifier" "commentMonitor")
+primary_tools=("infra")
+helper_tools=("amGithubNotifier" "comment-monitor")
 
 function fetch_embedmd {
-  pushd ..; go get github.com/campoy/embedmd; popd
+  pushd ..
+  go install github.com/campoy/embedmd/v2@latest
+  popd
 }
 
 function docs {

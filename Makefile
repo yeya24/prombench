@@ -1,7 +1,7 @@
 DOCKER_REPO             ?= prominfra
 
 .PHONY: all
-all: precheck style check_license lint build test unused docs-check
+all: precheck style check_license lint build test unused docs-check generate-dashboards-cm
 
 .PHONY: docker
 docker:
@@ -23,5 +23,26 @@ docs:
 .PHONY: docs-check
 docs-check:
 	./scripts/genflagdocs.sh check
+
+.PHONY: generate-dashboards-cm
+generate-dashboards-cm:
+	./scripts/sync-dashboards-to-configmap.sh
+
+GOIMPORTS = goimports
+$(GOIMPORTS):
+	@go install golang.org/x/tools/cmd/goimports@latest
+
+GOFUMPT = gofumpt
+$(GOFUMPT):
+	@go install mvdan.cc/gofumpt@latest
+
+GO_FILES = $(shell find . -path ./vendor -prune -o -name '*.go' -print)
+
+.PHONY: format
+format: $(GOFUMPT) $(GOIMPORTS)
+	@echo ">> formating imports)"
+	@$(GOIMPORTS) -local github.com/prometheus/test-infra -w $(GO_FILES)
+	@echo ">> gofumpt-ing the code; golangci-lint requires this"
+	@$(GOFUMPT) -extra -w $(GO_FILES)
 
 include Makefile.common

@@ -16,7 +16,6 @@ package provider
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -62,6 +61,56 @@ type Resource struct {
 	Content  []byte
 }
 
+// Checker is a named readiness check.
+type Checker struct {
+	Name  string
+	Check func() (bool, error)
+}
+
+// RetryUntilAllTrue polls all checkers until they all return true or an error occurs.
+// It prints a combined readiness status at each iteration.
+func RetryUntilAllTrue(retryCount int, checkers []Checker) error {
+	const retryInterval = 15 * time.Second
+	ready := make([]bool, len(checkers))
+	for i := 1; i <= retryCount; i++ {
+		allReady := true
+		for j, c := range checkers {
+			if ready[j] {
+				continue
+			}
+			ok, err := c.Check()
+			if err != nil {
+				return err
+			}
+			ready[j] = ok
+			if !ok {
+				allReady = false
+			}
+		}
+		log.Printf("Readiness status:")
+		for j, c := range checkers {
+			mark := " "
+			name := c.Name
+			if ready[j] {
+				mark = "\033[32m✔\033[0m"
+				name = "\033[32m" + name + "\033[0m"
+			}
+			log.Printf("  [%s] %s", mark, name)
+		}
+		if allReady {
+			return nil
+		}
+		time.Sleep(retryInterval)
+	}
+	var notReady []string
+	for j, c := range checkers {
+		if !ready[j] {
+			notReady = append(notReady, c.Name)
+		}
+	}
+	return fmt.Errorf("resources not ready after %d retries: %s", retryCount, strings.Join(notReady, ", "))
+}
+
 // RetryUntilTrue returns when there is an error or the requested operation returns true.
 func RetryUntilTrue(name string, retryCount int, fn func() (bool, error)) error {
 	for i := 1; i <= retryCount; i++ {
@@ -85,14 +134,14 @@ func applyTemplateVars(content []byte, deploymentVars map[string]string) ([]byte
 	t = t.Funcs(template.FuncMap{
 		// k8s objects can't have dots(.) se we add a custom function to allow normalising the variable values.
 		"normalise": func(t string) string {
-			return strings.Replace(t, ".", "-", -1)
+			return strings.ReplaceAll(t, ".", "-")
 		},
 		"split": func(rangeVars, separator string) []string {
 			return strings.Split(rangeVars, separator)
 		},
 	})
 	if err := template.Must(t.Parse(string(content))).Execute(fileContentParsed, deploymentVars); err != nil {
-		return nil, fmt.Errorf("Failed to execute parse file err: %s", err)
+		return nil, fmt.Errorf("Failed to execute parse file err: %w", err)
 	}
 	return fileContentParsed.Bytes(), nil
 }
@@ -103,13 +152,13 @@ func DeploymentsParse(deploymentFiles []string, deploymentVars map[string]string
 	var fileList []string
 	for _, name := range deploymentFiles {
 		if file, err := os.Stat(name); err == nil && file.IsDir() {
-			if err := filepath.Walk(name, func(path string, f os.FileInfo, err error) error {
+			if err := filepath.Walk(name, func(path string, _ os.FileInfo, _ error) error {
 				if filepath.Ext(path) == ".yaml" || filepath.Ext(path) == ".yml" {
 					fileList = append(fileList, path)
 				}
 				return nil
 			}); err != nil {
-				return nil, fmt.Errorf("error reading directory: %v", err)
+				return nil, fmt.Errorf("error reading directory: %w", err)
 			}
 		} else {
 			fileList = append(fileList, name)
@@ -119,7 +168,7 @@ func DeploymentsParse(deploymentFiles []string, deploymentVars map[string]string
 	deploymentObjects := make([]Resource, 0)
 	for _, name := range fileList {
 		absFileName := strings.TrimSuffix(filepath.Base(name), filepath.Ext(name))
-		content, err := ioutil.ReadFile(name)
+		content, err := os.ReadFile(name)
 		if err != nil {
 			log.Fatalf("Error reading file %v:%v", name, err)
 		}
@@ -127,7 +176,7 @@ func DeploymentsParse(deploymentFiles []string, deploymentVars map[string]string
 		if !strings.HasSuffix(absFileName, "noparse") {
 			content, err = applyTemplateVars(content, deploymentVars)
 			if err != nil {
-				return nil, fmt.Errorf("couldn't apply template to file %s: %v", name, err)
+				return nil, fmt.Errorf("couldn't apply template to file %s: %w", name, err)
 			}
 		}
 		deploymentObjects = append(deploymentObjects, Resource{FileName: name, Content: content})

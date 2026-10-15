@@ -24,9 +24,9 @@ spec:
       hostNetwork: true
       hostPID: true
       nodeSelector:
-        node-name: main-node
+        cloud.google.com/gke-nodepool: main-node
       containers:
-      - image: quay.io/prometheus/node-exporter:v1.0.1
+      - image: quay.io/prometheus/node-exporter:v1.8.1
         args:
         - "--path.procfs=/host/proc"
         - "--path.sysfs=/host/sys"
@@ -40,7 +40,7 @@ spec:
           name: scrape
         volumeMounts:
         - name: proc
-          readOnly:  true
+          readOnly: true
           mountPath: /host/proc
         - name: sys
           readOnly: true

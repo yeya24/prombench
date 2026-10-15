@@ -18,23 +18,22 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
-	"github.com/prometheus/test-infra/pkg/provider"
-	k8sProvider "github.com/prometheus/test-infra/pkg/provider/k8s"
-	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/alecthomas/kingpin/v2"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"sigs.k8s.io/kind/pkg/cluster"
 	"sigs.k8s.io/kind/pkg/cmd"
+
+	"github.com/prometheus/test-infra/pkg/provider"
+	k8sProvider "github.com/prometheus/test-infra/pkg/provider/k8s"
 )
 
 type Resource = provider.Resource
 
 // KIND holds the fields used to generate an API request.
 type KIND struct {
-
 	// The k8s provider used when we work with the manifest files.
 	k8sProvider *k8sProvider.K8s
 	// The kind provider used to instantiate a new provider.
@@ -108,7 +107,6 @@ func (c *KIND) K8SDeploymentsParse(*kingpin.ParseContext) error {
 		return err
 	}
 	for _, deployment := range deploymentResource {
-
 		decode := scheme.Codecs.UniversalDeserializer().Decode
 		k8sObjects := make([]runtime.Object, 0)
 
@@ -120,7 +118,7 @@ func (c *KIND) K8SDeploymentsParse(*kingpin.ParseContext) error {
 
 			resource, _, err := decode([]byte(text), nil, nil)
 			if err != nil {
-				return errors.Wrapf(err, "decoding the resource file:%v, section:%v...", deployment.FileName, text[:100])
+				return fmt.Errorf("decoding the resource file:%v, section:%v...: %w", deployment.FileName, text[:100], err)
 			}
 			if resource == nil {
 				continue
@@ -187,7 +185,7 @@ func (c *KIND) NewK8sProvider(*kingpin.ParseContext) error {
 
 // ResourceApply calls k8s.ResourceApply to apply the k8s objects in the manifest files.
 func (c *KIND) ResourceApply(*kingpin.ParseContext) error {
-	if err := c.k8sProvider.ResourceApply(c.k8sResources); err != nil {
+	if err := c.k8sProvider.ResourceApply(c.k8sResources, true); err != nil {
 		return err
 	}
 	return nil
@@ -202,7 +200,7 @@ func (c *KIND) ResourceDelete(*kingpin.ParseContext) error {
 }
 
 // GetDeploymentVars shows deployment variables.
-func (c *KIND) GetDeploymentVars(parseContext *kingpin.ParseContext) error {
+func (c *KIND) GetDeploymentVars(_ *kingpin.ParseContext) error {
 	fmt.Print("-------------------\n   DeploymentVars   \n------------------- \n")
 	for key, value := range c.DeploymentVars {
 		fmt.Println(key, ": ", value)

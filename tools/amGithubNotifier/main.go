@@ -17,17 +17,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 
-	"github.com/google/go-github/v29/github"
+	"github.com/alecthomas/kingpin/v2"
+	"github.com/google/go-github/v89/github"
 	"github.com/prometheus/alertmanager/notify/webhook"
 	"github.com/prometheus/alertmanager/template"
-	"golang.org/x/oauth2"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 type ghWebhookReceiverConfig struct {
@@ -128,27 +126,29 @@ func (hl ghWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func newGhWebhookReceiver(cfg ghWebhookReceiverConfig) (*ghWebhookReceiver, error) {
-
 	if cfg.dryRun {
+		ghClient, err := github.NewClient()
+		if err != nil {
+			return nil, err
+		}
 		return &ghWebhookReceiver{
-			ghClient: github.NewClient(nil),
+			ghClient: ghClient,
 			cfg:      cfg,
 		}, nil
 	}
 
 	// Add github token.
-	oauth2token, err := ioutil.ReadFile(cfg.authFile)
+	oauth2token, err := os.ReadFile(cfg.authFile)
 	if err != nil {
 		return nil, err
 	}
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: string(oauth2token)},
-	)
-	ctx := context.Background()
-	tc := oauth2.NewClient(ctx, ts)
 
+	ghClient, err := github.NewClient(github.WithAuthToken(string(oauth2token)))
+	if err != nil {
+		return nil, err
+	}
 	return &ghWebhookReceiver{
-		ghClient: github.NewClient(tc),
+		ghClient: ghClient,
 		cfg:      cfg,
 	}, nil
 }
@@ -176,7 +176,6 @@ func (g ghWebhookReceiver) processAlert(ctx context.Context, alert template.Aler
 }
 
 func (g ghWebhookReceiver) processAlerts(ctx context.Context, msg *webhook.Message) ([]string, error) {
-
 	var alertcomments []string
 
 	// Each alert will have its own comment.

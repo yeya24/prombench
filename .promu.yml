@@ -1,23 +1,25 @@
 go:
-    # Whenever the Go version is updated here, .travis.yml and
-    # .circle/config.yml should also be updated if in use.
-    version: 1.13
+    # Whenever the Go version is updated here, .github/workflows/ci.yml
+    # should also be updated if in use.
+    version: 1.27
 repository:
     path: github.com/prometheus/test-infra
 build:
     binaries:
         - name: infra
           path: ./infra
-        - name: funcbench
-          path: ./funcbench
         - name: tools/amGithubNotifier
           path: ./tools/amGithubNotifier
-        - name: tools/commentMonitor
-          path: ./tools/commentMonitor
+        - name: tools/comment-monitor
+          path: ./tools/comment-monitor
         - name: tools/fake-webserver
           path: ./tools/fake-webserver
         - name: tools/scaler
           path: ./tools/scaler
+        - name: tools/load-generator
+          path: ./tools/load-generator
+        - name: tools/block-sync
+          path: ./tools/block-sync
     flags: -a -tags netgo
 crossbuild:
     platforms:

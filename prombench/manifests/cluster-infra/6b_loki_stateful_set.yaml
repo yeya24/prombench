@@ -1,4 +1,15 @@
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loki
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1000Gi  # If you change this make sure to update the Loki disk retention_period settings.
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: loki
@@ -7,39 +18,56 @@ metadata:
 data:
   loki.yaml: |
     auth_enabled: false
-    ingester:
-      chunk_idle_period: 15m
-      chunk_block_size: 262144
-      lifecycler:
-        ring:
-          kvstore:
-            store: inmemory
-          replication_factor: 1
-    limits_config:
-      enforce_metric_name: false
-      reject_old_samples: true
-      reject_old_samples_max_age: 168h
+
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /data/loki
+      storage:
+        filesystem:
+          chunks_directory: /data/loki/chunks
+          rules_directory: /data/loki/rules
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+
+    query_range:
+      results_cache:
+        cache:
+          embedded_cache:
+            enabled: true
+            max_size_mb: 100
+
     schema_config:
       configs:
-      - from: 2018-04-15
-        store: boltdb
+      - from: 2024-10-20
+        store: tsdb
         object_store: filesystem
-        schema: v9
+        schema: v13
         index:
           prefix: index_
-          period: 168h
+          period: 24h
+
+    pattern_ingester:
+      enabled: true
+      metric_aggregation:
+        enabled: true
+        loki_address: localhost:3100
+
+    frontend:
+      encoding: protobuf
+
     server:
       http_listen_port: 3100
-    storage_config:
-      boltdb:
-        directory: /data/loki/index
-      filesystem:
-        directory: /data/loki/chunks
-    chunk_store_config:
-      max_look_back_period: 0s
-    table_manager:
-      retention_deletes_enabled: false
-      retention_period: 0s
+      grpc_listen_port: 9096
+      log_level: info
+      grpc_server_max_concurrent_streams: 1000
+
+    compactor:
+      retention_enabled: true
+      delete_request_store: filesystem
+    limits_config:
+      retention_period: 2184h
 ---
 apiVersion: v1
 kind: Service
@@ -86,10 +114,14 @@ spec:
         runAsUser: 10001
       containers:
         - name: loki
-          image: grafana/loki:1.4.1
+          image: grafana/loki:3.2.1
           imagePullPolicy: IfNotPresent
           args:
             - "-config.file=/etc/loki/loki.yaml"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 200Mi
           volumeMounts:
             - name: config
               mountPath: /etc/loki
@@ -100,11 +132,6 @@ spec:
             - name: http-metrics
               containerPort: 3100
               protocol: TCP
-          livenessProbe:
-            httpGet:
-              path: /ready
-              port: http-metrics
-            initialDelaySeconds: 45
           readinessProbe:
             httpGet:
               path: /ready
@@ -113,7 +140,7 @@ spec:
           securityContext:
             readOnlyRootFilesystem: true
       nodeSelector:
-        node-name: main-node
+        cloud.google.com/gke-nodepool: main-node
       terminationGracePeriodSeconds: 30
       volumes:
         - name: config
@@ -121,7 +148,7 @@ spec:
             name: loki
         - name: storage
           persistentVolumeClaim:
-            claimName: prometheus-meta
+            claimName: loki
 ---
 apiVersion: v1
 kind: Service

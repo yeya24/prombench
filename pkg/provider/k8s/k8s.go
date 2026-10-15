@@ -15,33 +15,36 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 
-	"github.com/pkg/errors"
-	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/alecthomas/kingpin/v2"
+	admissionregistration "k8s.io/api/admissionregistration/v1"
 	appsV1 "k8s.io/api/apps/v1"
 	batchV1 "k8s.io/api/batch/v1"
 	apiCoreV1 "k8s.io/api/core/v1"
-	apiExtensionsV1beta1 "k8s.io/api/extensions/v1beta1"
+	apiNetworkingV1 "k8s.io/api/networking/v1"
 	rbac "k8s.io/api/rbac/v1"
+	apiServerExtensionsV1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	apiServerExtensionsClient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apiErrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMetaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
-	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/util/retry"
-
-	"strings"
-
-	"github.com/prometheus/test-infra/pkg/provider"
-
-	apiServerExtensionsV1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	apiServerExtensionsClient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/util/retry"
+	_ "k8s.io/cloud-provider-gcp/pkg/clientauthplugin/gcp"
+
+	"github.com/prometheus/test-infra/pkg/provider"
 )
 
 func init() {
@@ -81,17 +84,17 @@ func New(ctx context.Context, config *clientcmdapi.Config) (*K8s, error) {
 		restConfig, err = clientcmd.NewDefaultClientConfig(*config, &clientcmd.ConfigOverrides{}).ClientConfig()
 	}
 	if err != nil {
-		return nil, errors.Wrapf(err, "k8s config error")
+		return nil, fmt.Errorf("k8s config error: %w", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		return nil, errors.Wrapf(err, "k8s client error")
+		return nil, fmt.Errorf("k8s client error: %w", err)
 	}
 
 	apiExtClientset, err := apiServerExtensionsClient.NewForConfig(restConfig)
 	if err != nil {
-		return nil, errors.Wrapf(err, "k8s api extensions client error")
+		return nil, fmt.Errorf("k8s api extensions client error: %w", err)
 	}
 
 	return &K8s{
@@ -116,7 +119,6 @@ func (c *K8s) DeploymentsParse(*kingpin.ParseContext) error {
 	}
 
 	for _, deployment := range deploymentResource {
-
 		decode := scheme.Codecs.UniversalDeserializer().Decode
 		k8sObjects := make([]runtime.Object, 0)
 
@@ -128,7 +130,7 @@ func (c *K8s) DeploymentsParse(*kingpin.ParseContext) error {
 
 			resource, _, err := decode([]byte(text), nil, nil)
 			if err != nil {
-				return errors.Wrapf(err, "decoding the resource file:%v, section:%v...", deployment.FileName, text[:100])
+				return fmt.Errorf("decoding the resource file:%v, section:%v...: %w", deployment.FileName, text[:100], err)
 			}
 			if resource == nil {
 				continue
@@ -144,7 +146,40 @@ func (c *K8s) DeploymentsParse(*kingpin.ParseContext) error {
 
 // ResourceApply applies k8s objects.
 // The input is a slice of structs containing the filename and the slice of k8s objects present in the file.
-func (c *K8s) ResourceApply(deployments []Resource) error {
+// If wait is true, each wave blocks until all deployments and stateful sets in it are ready.
+func (c *K8s) ResourceApply(deployments []Resource, wait bool) error {
+	// Group deployments by wave number extracted from filename prefix.
+	waves := make(map[int][]Resource)
+	for _, deployment := range deployments {
+		wave := extractWave(deployment.FileName)
+		waves[wave] = append(waves[wave], deployment)
+	}
+
+	// Sort wave numbers.
+	waveNums := make([]int, 0, len(waves))
+	for w := range waves {
+		waveNums = append(waveNums, w)
+	}
+	sort.Ints(waveNums)
+
+	// Apply and optionally wait wave by wave.
+	for _, wave := range waveNums {
+		if err := c.applyWave(wave, waves[wave], wait); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyWave applies all resources in a wave and, if wait is true, waits for
+// any deployments or stateful sets in that wave to become ready.
+func (c *K8s) applyWave(wave int, deployments []Resource, wait bool) error {
+	type pendingResource struct {
+		fileName string
+		obj      runtime.Object
+	}
+	var pendingDeployments []pendingResource
+	var pendingStatefulSets []pendingResource
 
 	var err error
 	for _, deployment := range deployments {
@@ -159,7 +194,10 @@ func (c *K8s) ResourceApply(deployments []Resource) error {
 			case "daemonset":
 				err = c.daemonSetApply(resource)
 			case "deployment":
-				err = c.deploymentApply(resource)
+				err = c.deploymentCreate(resource)
+				if err == nil {
+					pendingDeployments = append(pendingDeployments, pendingResource{deployment.FileName, resource})
+				}
 			case "ingress":
 				err = c.ingressApply(resource)
 			case "namespace":
@@ -179,24 +217,71 @@ func (c *K8s) ResourceApply(deployments []Resource) error {
 			case "customresourcedefinition":
 				err = c.customResourceApply(resource)
 			case "statefulset":
-				err = c.statefulSetApply(resource)
+				err = c.statefulSetCreate(resource)
+				if err == nil {
+					pendingStatefulSets = append(pendingStatefulSets, pendingResource{deployment.FileName, resource})
+				}
 			case "job":
 				err = c.jobApply(resource)
+			case "validatingwebhookconfiguration":
+				err = c.validatingWebhookConfigurationApply(resource)
+			case "ingressclass":
+				err = c.ingressClassApply(resource)
 			default:
 				err = fmt.Errorf("creating request for unimplimented resource type:%v", kind)
 			}
 			if err != nil {
-				return fmt.Errorf("error applying '%v' err:%v", deployment.FileName, err)
+				return fmt.Errorf("error applying '%v' err: %w", deployment.FileName, err)
 			}
+		}
+	}
+
+	var checkers []provider.Checker
+	for _, p := range pendingDeployments {
+		p := p
+		req := p.obj.(*appsV1.Deployment)
+		checkers = append(checkers, provider.Checker{
+			Name:  req.Name,
+			Check: func() (bool, error) { return c.deploymentReady(p.obj) },
+		})
+	}
+	for _, p := range pendingStatefulSets {
+		p := p
+		req := p.obj.(*appsV1.StatefulSet)
+		checkers = append(checkers, provider.Checker{
+			Name:  req.Name,
+			Check: func() (bool, error) { return c.statefulSetReady(p.obj) },
+		})
+	}
+	if wait && len(checkers) > 0 {
+		log.Printf("Waiting for wave %d readiness (%d resources)...", wave, len(checkers))
+		if err := provider.RetryUntilAllTrue(provider.GlobalRetryCount, checkers); err != nil {
+			return fmt.Errorf("error waiting for wave %d resources: %w", wave, err)
 		}
 	}
 	return nil
 }
 
+// extractWave returns the wave number from a filename by splitting on "_"
+// and parsing the first part as an integer.
+// For example, "path/to/4_fake-webserver.yaml" returns 4.
+// If no valid integer prefix is found, it returns 0.
+func extractWave(fileName string) int {
+	base := filepath.Base(fileName)
+	parts := strings.SplitN(base, "_", 2)
+	if len(parts) < 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // ResourceDelete deletes k8s objects.
 // The input is a slice of structs containing the filename and the slice of k8s objects present in the file.
 func (c *K8s) ResourceDelete(deployments []Resource) error {
-
 	var err error
 	for _, deployment := range deployments {
 		for _, resource := range deployment.Objects {
@@ -233,11 +318,15 @@ func (c *K8s) ResourceDelete(deployments []Resource) error {
 				err = c.statefulSetDelete(resource)
 			case "job":
 				err = c.jobDelete(resource)
+			case "validatingwebhookconfiguration":
+				err = c.validatingWebhookConfigurationDelete(resource)
+			case "ingressclass":
+				err = c.ingressClassDelete(resource)
 			default:
 				err = fmt.Errorf("deleting request for unimplimented resource type:%v", kind)
 			}
 			if err != nil {
-				return fmt.Errorf("error deleting '%v' err:%v", deployment.FileName, err)
+				return fmt.Errorf("error deleting '%v' err: %w", deployment.FileName, err)
 			}
 		}
 	}
@@ -255,7 +344,7 @@ func (c *K8s) clusterRoleApply(resource runtime.Object) error {
 
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "listing resource : %v", kind)
+			return fmt.Errorf("listing resource : %v: %w", kind, err)
 		}
 
 		var exists bool
@@ -271,12 +360,12 @@ func (c *K8s) clusterRoleApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 		return nil
@@ -294,7 +383,7 @@ func (c *K8s) clusterRoleBindingApply(resource runtime.Object) error {
 		client := c.clt.RbacV1().ClusterRoleBindings()
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -310,12 +399,12 @@ func (c *K8s) clusterRoleBindingApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -333,39 +422,33 @@ func (c *K8s) configMapApply(resource runtime.Object) error {
 
 	switch v := resource.GetObjectKind().GroupVersionKind().Version; v {
 	case "v1":
-
 		client := c.clt.CoreV1().ConfigMaps(req.Namespace)
 
-		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
+		// Set API version and kind for server-side apply.
+		req.APIVersion = "v1"
+		req.Kind = "ConfigMap"
+
+		// Marshal the ConfigMap to JSON for server-side apply.
+		data, err := json.Marshal(req)
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error marshaling ConfigMap: %w", err)
 		}
 
-		var exists bool
-		for _, l := range list.Items {
-			if l.Name == req.Name {
-				exists = true
-				break
-			}
+		// Use server-side apply via Patch method.
+		// This avoids storing last-applied-configuration in annotations.
+		force := true
+		_, err = client.Patch(c.ctx, req.Name, types.ApplyPatchType, data, apiMetaV1.PatchOptions{
+			FieldManager: "test-infra",
+			Force:        &force,
+		})
+		if err != nil {
+			return fmt.Errorf("resource apply failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
-
-		if exists {
-			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
-				return err
-			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
-			}
-			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
-			return nil
-		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
-		}
-		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
+		log.Printf("resource applied - kind: %v, name: %v", kind, req.Name)
+		return nil
 	default:
 		return fmt.Errorf("unknown object version: %v kind:'%v', name:'%v'", v, kind, req.Name)
 	}
-	return nil
 }
 
 func (c *K8s) daemonSetApply(resource runtime.Object) error {
@@ -380,7 +463,7 @@ func (c *K8s) daemonSetApply(resource runtime.Object) error {
 		client := c.clt.AppsV1().DaemonSets(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -396,12 +479,12 @@ func (c *K8s) daemonSetApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -410,7 +493,7 @@ func (c *K8s) daemonSetApply(resource runtime.Object) error {
 	return c.daemonsetReady(resource)
 }
 
-func (c *K8s) deploymentApply(resource runtime.Object) error {
+func (c *K8s) deploymentCreate(resource runtime.Object) error {
 	req := resource.(*appsV1.Deployment)
 	kind := resource.GetObjectKind().GroupVersionKind().Kind
 	if len(req.Namespace) == 0 {
@@ -422,7 +505,7 @@ func (c *K8s) deploymentApply(resource runtime.Object) error {
 		client := c.clt.AppsV1().Deployments(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -438,25 +521,22 @@ func (c *K8s) deploymentApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 		} else {
 			if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-				return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 		}
 	default:
 		return fmt.Errorf("unknown object version: %v kind:'%v', name:'%v'", v, kind, req.Name)
 	}
-	return provider.RetryUntilTrue(
-		fmt.Sprintf("applying deployment:%v", req.Name),
-		provider.GlobalRetryCount,
-		func() (bool, error) { return c.deploymentReady(resource) })
+	return nil
 }
 
-func (c *K8s) statefulSetApply(resource runtime.Object) error {
+func (c *K8s) statefulSetCreate(resource runtime.Object) error {
 	req := resource.(*appsV1.StatefulSet)
 	kind := resource.GetObjectKind().GroupVersionKind().Kind
 	if len(req.Namespace) == 0 {
@@ -468,7 +548,7 @@ func (c *K8s) statefulSetApply(resource runtime.Object) error {
 		client := c.clt.AppsV1().StatefulSets(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 		var exists bool
 		for _, l := range list.Items {
@@ -483,23 +563,19 @@ func (c *K8s) statefulSetApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 		} else {
 			if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-				return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 		}
 	default:
 		return fmt.Errorf("unknown object version: %v kind:'%v', name:'%v'", v, kind, req.Name)
 	}
-
-	return provider.RetryUntilTrue(
-		fmt.Sprintf("applying statefulSet:%v", req.Name),
-		provider.GlobalRetryCount,
-		func() (bool, error) { return c.statefulSetReady(resource) })
+	return nil
 }
 
 func (c *K8s) jobApply(resource runtime.Object) error {
@@ -514,7 +590,7 @@ func (c *K8s) jobApply(resource runtime.Object) error {
 		client := c.clt.BatchV1().Jobs(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 		var exists bool
 		for _, l := range list.Items {
@@ -529,12 +605,12 @@ func (c *K8s) jobApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -545,6 +621,48 @@ func (c *K8s) jobApply(resource runtime.Object) error {
 		fmt.Sprintf("running job:%v", req.Name),
 		Infinite,
 		func() (bool, error) { return c.jobReady(resource) })
+}
+
+func (c *K8s) validatingWebhookConfigurationApply(resource runtime.Object) error {
+	req := resource.(*admissionregistration.ValidatingWebhookConfiguration)
+	kind := resource.GetObjectKind().GroupVersionKind().Kind
+
+	switch v := resource.GetObjectKind().GroupVersionKind().Version; v {
+	case "v1":
+		client := c.clt.AdmissionregistrationV1().ValidatingWebhookConfigurations()
+		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
+		if err != nil {
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
+		}
+		var exists bool
+		for _, l := range list.Items {
+			if req.ResourceVersion == "" {
+				req.ResourceVersion = l.ResourceVersion
+			}
+
+			if l.Name == req.Name {
+				exists = true
+				break
+			}
+		}
+
+		if exists {
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
+				return err
+			}); err != nil {
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
+			}
+			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
+			return nil
+		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
+		}
+		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
+	default:
+		return fmt.Errorf("unknown object version: %v kind:'%v', name:'%v'", v, kind, req.Name)
+	}
+	return nil
 }
 
 func (c *K8s) customResourceApply(resource runtime.Object) error {
@@ -559,7 +677,7 @@ func (c *K8s) customResourceApply(resource runtime.Object) error {
 		client := c.ApiExtClient.ApiextensionsV1beta1().CustomResourceDefinitions()
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 		var exists bool
 		for _, l := range list.Items {
@@ -573,12 +691,12 @@ func (c *K8s) customResourceApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -589,18 +707,18 @@ func (c *K8s) customResourceApply(resource runtime.Object) error {
 }
 
 func (c *K8s) ingressApply(resource runtime.Object) error {
-	req := resource.(*apiExtensionsV1beta1.Ingress)
+	req := resource.(*apiNetworkingV1.Ingress)
 	kind := resource.GetObjectKind().GroupVersionKind().Kind
 	if len(req.Namespace) == 0 {
 		req.Namespace = "default"
 	}
 
 	switch v := resource.GetObjectKind().GroupVersionKind().Version; v {
-	case "v1beta1":
-		client := c.clt.ExtensionsV1beta1().Ingresses(req.Namespace)
+	case "v1":
+		client := c.clt.NetworkingV1().Ingresses(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -616,17 +734,55 @@ func (c *K8s) ingressApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
 		return fmt.Errorf("unknown object version: %v kind:'%v', name:'%v'", v, kind, req.Name)
 	}
+	return nil
+}
+
+func (c *K8s) ingressClassApply(resource runtime.Object) error {
+	req, ok := resource.(*apiNetworkingV1.IngressClass)
+	if !ok {
+		return fmt.Errorf("expected IngressClass, but got %T", resource)
+	}
+	kind := resource.GetObjectKind().GroupVersionKind().Kind
+
+	if resource.GetObjectKind().GroupVersionKind().Version != "v1" {
+		return fmt.Errorf("unknown object version: %v kind:'%v', name:'%v'",
+			resource.GetObjectKind().GroupVersionKind().Version, kind, req.Name)
+	}
+
+	client := c.clt.NetworkingV1().IngressClasses()
+	list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("error listing resource: %v, name: %v: %w", kind, req.Name, err)
+	}
+
+	for _, l := range list.Items {
+		if l.Name == req.Name {
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
+				return err
+			}); err != nil {
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
+			}
+			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
+			return nil
+		}
+	}
+
+	if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
+		return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
+	}
+	log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	return nil
 }
 
@@ -639,7 +795,7 @@ func (c *K8s) nameSpaceApply(resource runtime.Object) error {
 		client := c.clt.CoreV1().Namespaces()
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -655,12 +811,12 @@ func (c *K8s) nameSpaceApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 
@@ -682,7 +838,7 @@ func (c *K8s) roleApply(resource runtime.Object) error {
 		client := c.clt.RbacV1().Roles(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -698,12 +854,12 @@ func (c *K8s) roleApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -724,7 +880,7 @@ func (c *K8s) roleBindingApply(resource runtime.Object) error {
 		client := c.clt.RbacV1().RoleBindings(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -740,12 +896,12 @@ func (c *K8s) roleBindingApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -766,7 +922,7 @@ func (c *K8s) serviceAccountApply(resource runtime.Object) error {
 		client := c.clt.CoreV1().ServiceAccounts(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -782,12 +938,12 @@ func (c *K8s) serviceAccountApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -808,7 +964,7 @@ func (c *K8s) serviceApply(resource runtime.Object) error {
 		client := c.clt.CoreV1().Services(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -832,12 +988,12 @@ func (c *K8s) serviceApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -861,7 +1017,7 @@ func (c *K8s) secretApply(resource runtime.Object) error {
 		client := c.clt.CoreV1().Secrets(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -877,12 +1033,12 @@ func (c *K8s) secretApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -902,7 +1058,7 @@ func (c *K8s) persistentVolumeClaimApply(resource runtime.Object) error {
 		client := c.clt.CoreV1().PersistentVolumeClaims(req.Namespace)
 		list, err := client.List(c.ctx, apiMetaV1.ListOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "error listing resource : %v, name: %v", kind, req.Name)
+			return fmt.Errorf("error listing resource : %v, name: %v: %w", kind, req.Name, err)
 		}
 
 		var exists bool
@@ -918,12 +1074,12 @@ func (c *K8s) persistentVolumeClaimApply(resource runtime.Object) error {
 				_, err := client.Update(c.ctx, req, apiMetaV1.UpdateOptions{})
 				return err
 			}); err != nil {
-				return errors.Wrapf(err, "resource update failed - kind: %v, name: %v", kind, req.Name)
+				return fmt.Errorf("resource update failed - kind: %v, name: %v: %w", kind, req.Name, err)
 			}
 			log.Printf("resource updated - kind: %v, name: %v", kind, req.Name)
 			return nil
 		} else if _, err := client.Create(c.ctx, req, apiMetaV1.CreateOptions{}); err != nil {
-			return errors.Wrapf(err, "resource creation failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource creation failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource created - kind: %v, name: %v", kind, req.Name)
 	default:
@@ -942,7 +1098,7 @@ func (c *K8s) clusterRoleDelete(resource runtime.Object) error {
 		client := c.clt.RbacV1().ClusterRoles()
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -960,7 +1116,7 @@ func (c *K8s) clusterRoleBindingDelete(resource runtime.Object) error {
 		client := c.clt.RbacV1().ClusterRoleBindings()
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -968,6 +1124,7 @@ func (c *K8s) clusterRoleBindingDelete(resource runtime.Object) error {
 	}
 	return nil
 }
+
 func (c *K8s) configMapDelete(resource runtime.Object) error {
 	req := resource.(*apiCoreV1.ConfigMap)
 	kind := resource.GetObjectKind().GroupVersionKind().Kind
@@ -980,7 +1137,7 @@ func (c *K8s) configMapDelete(resource runtime.Object) error {
 		client := c.clt.CoreV1().ConfigMaps(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1001,7 +1158,7 @@ func (c *K8s) daemonsetDelete(resource runtime.Object) error {
 		client := c.clt.AppsV1().DaemonSets(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1022,7 +1179,7 @@ func (c *K8s) deploymentDelete(resource runtime.Object) error {
 		client := c.clt.AppsV1().Deployments(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1043,7 +1200,7 @@ func (c *K8s) statefulSetDelete(resource runtime.Object) error {
 		client := c.clt.AppsV1().StatefulSets(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1064,7 +1221,7 @@ func (c *K8s) jobDelete(resource runtime.Object) error {
 		client := c.clt.BatchV1().Jobs(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1085,7 +1242,7 @@ func (c *K8s) customResourceDelete(resource runtime.Object) error {
 		client := c.ApiExtClient.ApiextensionsV1beta1().CustomResourceDefinitions()
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1096,23 +1253,45 @@ func (c *K8s) customResourceDelete(resource runtime.Object) error {
 }
 
 func (c *K8s) ingressDelete(resource runtime.Object) error {
-	req := resource.(*apiExtensionsV1beta1.Ingress)
+	req := resource.(*apiNetworkingV1.Ingress)
 	kind := resource.GetObjectKind().GroupVersionKind().Kind
 	if len(req.Namespace) == 0 {
 		req.Namespace = "default"
 	}
 
 	switch v := resource.GetObjectKind().GroupVersionKind().Version; v {
-	case "v1beta1":
-		client := c.clt.ExtensionsV1beta1().Ingresses(req.Namespace)
+	case "v1":
+		client := c.clt.NetworkingV1().Ingresses(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
 		return fmt.Errorf("unknown object version: %v kind:'%v', name:'%v'", v, kind, req.Name)
 	}
+	return nil
+}
+
+func (c *K8s) ingressClassDelete(resource runtime.Object) error {
+	req, ok := resource.(*apiNetworkingV1.IngressClass)
+	if !ok {
+		return fmt.Errorf("expected IngressClass, but got %T", resource)
+	}
+	kind := resource.GetObjectKind().GroupVersionKind().Kind
+
+	if resource.GetObjectKind().GroupVersionKind().Version != "v1" {
+		return fmt.Errorf("unknown object version: %v kind:'%v', name:'%v'",
+			resource.GetObjectKind().GroupVersionKind().Version, kind, req.Name)
+	}
+
+	client := c.clt.NetworkingV1().IngressClasses()
+	err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{})
+	if err != nil {
+		return fmt.Errorf("resource deletion failed - kind: %v, name: %v: %w", kind, req.Name, err)
+	}
+
+	log.Printf("resource deleted - kind: %v, name: %v", kind, req.Name)
 	return nil
 }
 
@@ -1125,7 +1304,7 @@ func (c *K8s) namespaceDelete(resource runtime.Object) error {
 		client := c.clt.CoreV1().Namespaces()
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleting - kind: %v , name: %v", kind, req.Name)
 		return provider.RetryUntilTrue(
@@ -1149,7 +1328,7 @@ func (c *K8s) roleDelete(resource runtime.Object) error {
 		client := c.clt.RbacV1().Roles(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1170,7 +1349,7 @@ func (c *K8s) roleBindingDelete(resource runtime.Object) error {
 		client := c.clt.RbacV1().RoleBindings(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1191,7 +1370,7 @@ func (c *K8s) serviceDelete(resource runtime.Object) error {
 		client := c.clt.CoreV1().Services(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1212,7 +1391,7 @@ func (c *K8s) serviceAccountDelete(resource runtime.Object) error {
 		client := c.clt.CoreV1().ServiceAccounts(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1232,7 +1411,7 @@ func (c *K8s) secretDelete(resource runtime.Object) error {
 		client := c.clt.CoreV1().Secrets(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1252,7 +1431,25 @@ func (c *K8s) persistentVolumeClaimDelete(resource runtime.Object) error {
 		client := c.clt.CoreV1().PersistentVolumeClaims(req.Namespace)
 		delPolicy := apiMetaV1.DeletePropagationForeground
 		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
-			return errors.Wrapf(err, "resource delete failed - kind: %v, name: %v", kind, req.Name)
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
+		}
+		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
+	default:
+		return fmt.Errorf("unknown object version: %v kind:'%v', name:'%v'", v, kind, req.Name)
+	}
+	return nil
+}
+
+func (c *K8s) validatingWebhookConfigurationDelete(resource runtime.Object) error {
+	req := resource.(*admissionregistration.ValidatingWebhookConfiguration)
+	kind := resource.GetObjectKind().GroupVersionKind().Kind
+
+	switch v := resource.GetObjectKind().GroupVersionKind().Version; v {
+	case "v1":
+		client := c.clt.AdmissionregistrationV1().ValidatingWebhookConfigurations()
+		delPolicy := apiMetaV1.DeletePropagationForeground
+		if err := client.Delete(c.ctx, req.Name, apiMetaV1.DeleteOptions{PropagationPolicy: &delPolicy}); err != nil {
+			return fmt.Errorf("resource delete failed - kind: %v, name: %v: %w", kind, req.Name, err)
 		}
 		log.Printf("resource deleted - kind: %v , name: %v", kind, req.Name)
 	default:
@@ -1273,14 +1470,13 @@ func (c *K8s) serviceExists(resource runtime.Object) (bool, error) {
 		client := c.clt.CoreV1().Services(req.Namespace)
 		res, err := client.Get(c.ctx, req.Name, apiMetaV1.GetOptions{})
 		if err != nil {
-			return false, errors.Wrapf(err, "Checking Service resource status failed")
+			return false, fmt.Errorf("Checking Service resource status failed: %w", err)
 		}
 		if res.Spec.Type == apiCoreV1.ServiceTypeLoadBalancer {
 			// K8s API currently just supports LoadBalancerStatus.
 			if len(res.Status.LoadBalancer.Ingress) > 0 {
 				log.Printf("\tService %s Details", req.Name)
 				for _, x := range res.Status.LoadBalancer.Ingress {
-
 					ingressHostAddr := ""
 					if len(x.IP) != 0 {
 						ingressHostAddr = x.IP
@@ -1314,7 +1510,7 @@ func (c *K8s) deploymentReady(resource runtime.Object) (bool, error) {
 
 		res, err := client.Get(c.ctx, req.Name, apiMetaV1.GetOptions{})
 		if err != nil {
-			return false, errors.Wrapf(err, "Checking Deployment resource:'%v' status failed err:%v", req.Name, err)
+			return false, fmt.Errorf("Checking Deployment resource:'%v' status failed err: %w", req.Name, err)
 		}
 
 		replicas := int32(1)
@@ -1343,7 +1539,7 @@ func (c *K8s) statefulSetReady(resource runtime.Object) (bool, error) {
 
 		res, err := client.Get(c.ctx, req.Name, apiMetaV1.GetOptions{})
 		if err != nil {
-			return false, errors.Wrapf(err, "Checking StatefulSet resource:'%v' status failed err:%v", req.Name, err)
+			return false, fmt.Errorf("Checking StatefulSet resource:'%v' status failed err: %w", req.Name, err)
 		}
 
 		replicas := int32(1)
@@ -1372,7 +1568,7 @@ func (c *K8s) jobReady(resource runtime.Object) (bool, error) {
 
 		res, err := client.Get(c.ctx, req.Name, apiMetaV1.GetOptions{})
 		if err != nil {
-			return false, errors.Wrapf(err, "Checking Job resource:'%v' status failed err:%v", req.Name, err)
+			return false, fmt.Errorf("Checking Job resource:'%v' status failed err: %w", req.Name, err)
 		}
 
 		// Current `jobReady` only works for non-parallel jobs.
@@ -1381,7 +1577,7 @@ func (c *K8s) jobReady(resource runtime.Object) (bool, error) {
 		if res.Status.Succeeded == count {
 			return true, nil
 		} else if res.Status.Failed == count {
-			return true, errors.New(fmt.Sprintf("Job %v has failed", req.Name))
+			return true, fmt.Errorf("Job %v has failed", req.Name)
 		}
 
 		return false, nil
@@ -1403,7 +1599,7 @@ func (c *K8s) daemonsetReady(resource runtime.Object) error {
 
 		res, err := client.Get(c.ctx, req.Name, apiMetaV1.GetOptions{})
 		if err != nil {
-			return errors.Wrapf(err, "Checking DaemonSet resource:'%v' status failed err:%v", req.Name, err)
+			return fmt.Errorf("Checking DaemonSet resource:'%v' status failed err: %w", req.Name, err)
 		}
 		if res.Status.NumberUnavailable == 0 {
 			return nil
@@ -1426,7 +1622,7 @@ func (c *K8s) namespaceDeleted(resource runtime.Object) (bool, error) {
 			if apiErrors.IsNotFound(err) {
 				return true, nil
 			}
-			return false, errors.Wrapf(err, "Couldn't get namespace '%v' err:%v", req.Name, err)
+			return false, fmt.Errorf("Couldn't get namespace '%v' err: %w", req.Name, err)
 		}
 		return false, nil
 	default:

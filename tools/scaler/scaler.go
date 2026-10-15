@@ -22,12 +22,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	appsV1 "k8s.io/api/apps/v1"
-
-	"github.com/pkg/errors"
-	"github.com/prometheus/test-infra/pkg/provider/k8s"
-	"gopkg.in/alecthomas/kingpin.v2"
 	"k8s.io/apimachinery/pkg/runtime"
+
+	"github.com/prometheus/test-infra/pkg/provider/k8s"
 )
 
 type scale struct {
@@ -40,7 +39,7 @@ type scale struct {
 func newScaler() *scale {
 	k, err := k8s.New(context.Background(), nil)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Error creating k8s client inside the k8s cluster"))
+		fmt.Fprintln(os.Stderr, fmt.Errorf("Error creating k8s client inside the k8s cluster: %w", err))
 		os.Exit(2)
 	}
 	return &scale{
@@ -75,15 +74,15 @@ func (s *scale) scale(*kingpin.ParseContext) error {
 
 	for {
 		log.Printf("Scaling Deployment to %d", s.max)
-		if err := s.k8sClient.ResourceApply(maxResourceObjects); err != nil {
-			fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Error scaling deployment"))
+		if err := s.k8sClient.ResourceApply(maxResourceObjects, false); err != nil {
+			fmt.Fprintln(os.Stderr, fmt.Errorf("Error scaling deployment: %w", err))
 		}
 
 		time.Sleep(s.interval)
 
 		log.Printf("Scaling Deployment to %d", s.min)
-		if err := s.k8sClient.ResourceApply(minResourceObjects); err != nil {
-			fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Error scaling deployment"))
+		if err := s.k8sClient.ResourceApply(minResourceObjects, false); err != nil {
+			fmt.Fprintln(os.Stderr, fmt.Errorf("Error scaling deployment: %w", err))
 		}
 
 		time.Sleep(s.interval)
@@ -91,7 +90,6 @@ func (s *scale) scale(*kingpin.ParseContext) error {
 }
 
 func main() {
-
 	app := kingpin.New(filepath.Base(os.Args[0]), "The Prombench-Scaler tool")
 	app.HelpFlag.Short('h')
 
@@ -118,7 +116,7 @@ func main() {
 		DurationVar(&s.interval)
 
 	if _, err := app.Parse(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Error parsing commandline arguments"))
+		fmt.Fprintln(os.Stderr, fmt.Errorf("Error parsing commandline arguments: %w", err))
 		app.Usage(os.Args[1:])
 		os.Exit(2)
 	}
